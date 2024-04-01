@@ -1,0 +1,254 @@
+---
+title: "Modèles de sévérité"
+author: "David Boulanger"
+date: "2024-03-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r import, message=FALSE, warning=FALSE}
+# Importation des données, paquetages et fonctions R
+source("tools.R")
+require(distRforest)
+
+train.sev <- read.csv2("train_sev.csv")[, -1]
+test.sev <- read.csv2("test_sev.csv")[, -1]
+
+# Retirer les colones inutiles
+keep.cols <- c("AGE_ASSURE", "OCCUPATION_ASSURE", "COTE_CREDIT", "NB_SINISTRE_0_5ANS", "NOMMUNI", "AIRE_DIFFUSION_2021", "AGE_BATIMENT", "AGE_TOITURE", "AGE_PLOMBERIE", "AGE_RESERVOIR_EAU_CHAUDE", "AGE_CHAUFFAGE_PRINCIPAL", "NOMBRE_CHAUFFAGES_EMPLACEMENT", "TYPE_CHAUFFAGE_PRINCIPAL", "ALIM_CHAUFFAGE_PRINCIPAL", "IND_CHAUF_COMBUSTION_SECONDAIRE", "INDICATEUR_MULTIPLE_LOGIS", "NB_CREANCIERS", "MONTANT_COUVERTURE", "CAUSE_SINISTRE", "MONTANT_PERTE", "LONGITUDE_X", "LATITUDE_Y")
+train.sev <- train.sev[, keep.cols]
+test.sev <- test.sev[, keep.cols]
+
+for(c in c("OCCUPATION_ASSURE", "COTE_CREDIT", "NB_SINISTRE_0_5ANS", "NOMMUNI", "NOMBRE_CHAUFFAGES_EMPLACEMENT", "TYPE_CHAUFFAGE_PRINCIPAL", "ALIM_CHAUFFAGE_PRINCIPAL", "IND_CHAUF_COMBUSTION_SECONDAIRE", "INDICATEUR_MULTIPLE_LOGIS", "CAUSE_SINISTRE")){
+    train.sev[, c] <- as.factor(train.sev[, c])
+    test.sev[, c] <- as.factor(test.sev[, c])
+}
+
+# EAU
+train.eau <- train.sev[train.sev$CAUSE_SINISTRE == "degat_eau", ]
+train.eau <- train.eau[, -which(colnames(train.eau) == "CAUSE_SINISTRE")]
+test.eau <- test.sev[test.sev$CAUSE_SINISTRE == "degat_eau", ]
+test.eau <- test.eau[, -which(colnames(test.eau) == "CAUSE_SINISTRE")]
+
+# FEU
+train.feu <- train.sev[train.sev$CAUSE_SINISTRE == "incendie", ]
+train.feu <- train.feu[, -which(colnames(train.feu) == "CAUSE_SINISTRE")]
+test.feu <- test.sev[test.sev$CAUSE_SINISTRE == "incendie", ]
+test.feu <- test.feu[, -which(colnames(test.feu) == "CAUSE_SINISTRE")]
+
+# METEO
+train.meteo <- train.sev[train.sev$CAUSE_SINISTRE == "meteo", ]
+train.meteo <- train.meteo[, -which(colnames(train.meteo) == "CAUSE_SINISTRE")]
+test.meteo <- test.sev[test.sev$CAUSE_SINISTRE == "meteo", ]
+test.meteo <- test.meteo[, -which(colnames(test.meteo) == "CAUSE_SINISTRE")]
+```
+
+Pour tous les modèles, on suppose :
+
+$$ (Y \mid N=cat, \ X ) \sim LN. $$
+
+# EAU
+
+## GLM
+
+```{r eau_glm}
+glm_eau <- glm(I(log(MONTANT_PERTE))~.-NB_SINISTRE_0_5ANS-AGE_CHAUFFAGE_PRINCIPAL-ALIM_CHAUFFAGE_PRINCIPAL-TYPE_CHAUFFAGE_PRINCIPAL-COTE_CREDIT-AGE_ASSURE-LONGITUDE_X-LATITUDE_Y+poly(AGE_ASSURE, 3), family = gaussian(link = "log"), data = train.eau)
+```
+
+## Boosting
+
+```{r eau_boosting}
+# Convertir la variable cible en log(MONTANT_PERTE)
+train.eau$log_MONTANT_PERTE <- log(train.eau$MONTANT_PERTE)
+# Définir les variables explicatives
+variables_explicatives <- setdiff(names(train.eau), c("MONTANT_PERTE", "log_MONTANT_PERTE"))
+# Créer un modèle de boosting avec gbm
+boost_eau <- gbm(
+  formula = log_MONTANT_PERTE ~ ., 
+  distribution = "gaussian",
+  data = train.eau[, c("log_MONTANT_PERTE", variables_explicatives)],
+  n.trees = 1500, # Nombre d'arbres
+  interaction.depth = 4, # Profondeur maximale des interactions
+  shrinkage = 0.05, # Taux de rétrécissement
+  cv.folds = 5, # Nombre de plis pour la validation croisée
+  verbose = FALSE, # Afficher les messages pendant l'ajustement
+)
+```
+
+## Comparaison
+
+```{r sum_eau}
+summary(glm_eau)
+summary(boost_eau)
+```
+
+```{r metrics_eau, message=F}
+pred_eau.glm <- predict(glm_eau, newdata = test.eau, type = "response")
+pred_eau.boost <- predict(boost_eau, newdata = test.eau, type = "response")
+data.frame(
+    Mod=c("GLM", "BOOST"),
+    MSE=c(
+        mean((pred_eau.glm - log(test.eau$MONTANT_PERTE))^2),
+        mean((pred_eau.boost - log(test.eau$MONTANT_PERTE))^2)
+    )
+)
+actual <- log(test.eau$MONTANT_PERTE)
+ref <- pred_eau.glm
+pred <- pred_eau.boost
+boost_eau$var <- var(train.eau$log_MONTANT_PERTE-boost_eau$fit)
+impact_analysis(actual, ref, pred, k=4)
+double_lift(actual, ref, pred, k=4)
+```
+
+# Feu
+
+## GLM
+
+```{r feu_glm}
+glm_feu <- glm(I(log(MONTANT_PERTE))~.-NB_SINISTRE_0_5ANS-NB_CREANCIERS-NOMBRE_CHAUFFAGES_EMPLACEMENT-IND_CHAUF_COMBUSTION_SECONDAIRE-AGE_TOITURE-COTE_CREDIT-ALIM_CHAUFFAGE_PRINCIPAL-AGE_RESERVOIR_EAU_CHAUDE+AGE_BATIMENT:AGE_PLOMBERIE, family = gaussian(link = "log"), data = train.feu)
+```
+
+## Boosting
+
+```{r feu_boost}
+# Convertir la variable cible en log(MONTANT_PERTE)
+train.feu$log_MONTANT_PERTE <- log(train.feu$MONTANT_PERTE)
+# Définir les variables explicatives
+variables_explicatives <- setdiff(names(train.feu), c("MONTANT_PERTE", "log_MONTANT_PERTE"))
+# Créer un modèle de boosting avec gbm
+boost_feu <- gbm(
+  formula = log_MONTANT_PERTE ~ ., 
+  distribution = "gaussian",
+  data = train.feu[, c("log_MONTANT_PERTE", variables_explicatives)],
+  n.trees = 1500, # Nombre d'arbres
+  interaction.depth = 4, # Profondeur maximale des interactions
+  shrinkage = 0.05, # Taux de rétrécissement
+  cv.folds = 5, # Nombre de plis pour la validation croisée
+  verbose = FALSE, # Afficher les messages pendant l'ajustement
+)
+```
+
+## Comparaison
+
+```{r sum_feu}
+summary(glm_feu)
+summary(boost_feu)
+```
+
+```{r metrics_feu, message=T}
+pred_feu.glm <- predict(glm_feu, newdata = test.feu, type = "response")
+pred_feu.boost <- predict(boost_feu, newdata = test.feu, type = "response")
+data.frame(
+    Mod=c("GLM", "BOOST"),
+    MSE=c(
+        mean((pred_feu.glm - log(test.feu$MONTANT_PERTE))^2),
+        mean((pred_feu.boost - log(test.feu$MONTANT_PERTE))^2)
+    )
+)
+actual <- log(test.feu$MONTANT_PERTE)
+ref <- pred_feu.glm
+pred <- pred_feu.boost
+boost_feu$var <- var(train.feu$log_MONTANT_PERTE-boost_feu$fit)
+impact_analysis(actual, ref, pred, k=4)
+double_lift(actual, ref, pred, k=4)
+```
+
+# Météo
+
+## GLM
+
+```{r glm_met}
+glm_met <- glm(I(log(MONTANT_PERTE))~.-INDICATEUR_MULTIPLE_LOGIS-OCCUPATION_ASSURE-AGE_BATIMENT-TYPE_CHAUFFAGE_PRINCIPAL-AGE_CHAUFFAGE_PRINCIPAL-NB_CREANCIERS-ALIM_CHAUFFAGE_PRINCIPAL, family = gaussian(link = "log"), data = train.meteo)
+```
+
+## Boosting
+
+```{r boosting_met}
+# Convertir la variable cible en log(MONTANT_PERTE)
+train.meteo$log_MONTANT_PERTE <- log(train.meteo$MONTANT_PERTE)
+# Définir les variables explicatives
+variables_explicatives <- setdiff(names(train.meteo), c("MONTANT_PERTE", "log_MONTANT_PERTE"))
+# Créer un modèle de boosting avec gbm
+boost_met <- gbm(
+  formula = log_MONTANT_PERTE ~ ., 
+  distribution = "gaussian",
+  data = train.meteo[, c("log_MONTANT_PERTE", variables_explicatives)],
+  n.trees = 1200, # Nombre d'arbres
+  interaction.depth = 4, # Profondeur maximale des interactions
+  shrinkage = 0.05, # Taux de rétrécissement
+  cv.folds = 5, # Nombre de plis pour la validation croisée
+  verbose = FALSE, # Afficher les messages pendant l'ajustement
+)
+train.meteo$log_MONTANT_PERTE <- NULL
+```
+
+## Random Forest
+
+```{r randomForest meteo}
+set.seed(1999)
+meteo_forest.control <- distRforest::rpart.control(
+    minbucket = 30, cp = 0, maxdepth = 7, xval = 0
+)
+rforest_met <- distRforest::rforest(
+    formula = MONTANT_PERTE~.,
+    data = train.meteo,
+    method = "lognormal",
+    control = meteo_forest.control,
+    ncand = 6,
+    ntrees = 500, 
+    subsample = 0.5,
+    track_oob = TRUE
+)
+```
+
+## Comparaison
+
+```{r sum_met}
+summary(glm_met)
+summary(boost_met)
+# summary(rforest_met)
+```
+
+```{r metrics_met, message=FALSE}
+pred_met.glm <- predict(glm_met, newdata = test.meteo, type = "response")
+pred_met.boost <- predict(boost_met, newdata = test.meteo, type = "response")
+pred_met.rforest <- predict.rforest(rforest_met, newdata = test.meteo)
+boost_met$var <- var(log(train.meteo$MONTANT_PERTE)-boost_met$fit)
+data.frame(
+    Mod=c("GLM", "BOOST", "randomForest"),
+    logMSE=c(
+        log(mean((exp(pred_met.glm + summary(glm_met)$disp/2) - test.meteo$MONTANT_PERTE)^2)),
+        log(mean((exp(pred_met.boost + boost_met$var/2)  - test.meteo$MONTANT_PERTE)^2)),
+        log(mean((pred_met.rforest - test.meteo$MONTANT_PERTE)^2))
+    )
+)
+
+actual <- test.meteo$MONTANT_PERTE
+ref <- exp(pred_met.glm + summary(glm_met)$disp/2)
+pred <- exp(pred_met.boost + boost_met$var/2)
+
+# GLM vs Boosting
+impact_analysis(actual, ref, pred, mod.names = c("GLM", "Boosting"), k=4)
+double_lift(actual, ref, pred, mod.names = c("GLM", "Boosting"), k=4)
+
+# rForest vs Boosting
+ref <- pred_met.rforest
+impact_analysis(actual, ref, pred, mod.names = c("RandomForest", "Boosting"), k=4)
+double_lift(actual, ref, pred, mod.names = c("RandomForest", "Boosting"), k=4)
+double_lift(actual, pred, ref, mod.names = c("Boosting", "RandomForest"), k=4)
+```
+
+# Saving models
+
+```{r save_mod}
+saveRDS(boost_eau, file = "eau_boosting")
+saveRDS(boost_feu, file = "feu_boosting")
+saveRDS(boost_met, file = "met_boosting")
+
+saveRDS(glm_eau, file = "eau_glm")
+saveRDS(glm_feu, file = "feu_glm")
+saveRDS(glm_met, file = "met_glm")
+```

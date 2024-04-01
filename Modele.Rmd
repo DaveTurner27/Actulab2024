@@ -1,0 +1,40 @@
+---
+title: "Modele"
+output: html_document
+---
+
+Importation des données et des paquetages.
+
+```{r paquetages, message=FALSE, warning=FALSE}
+source("tools.R")
+inst <- liste.paquetage %in% installed.packages()
+if(length(liste.paquetage[!inst]) > 0) install.packages(liste.paquetage[!inst])
+paquetages <- lapply(liste.paquetage, require, character.only = TRUE)
+```
+
+```{r data}
+data <- read.csv("polices-futures.csv")
+eau <- readRDS("eau_boosting")
+feu <- readRDS("feu_boosting")
+met <- readRDS("met_boosting")
+freq <- readRDS("freq_boosting")
+```
+
+```{r prep_data}
+data.prep <- prepare_df(data)
+freq_data <- model.matrix(~., data = data.prep[, c("AGE_ASSURE", "OCCUPATION_ASSURE", "COTE_CREDIT", "NB_SINISTRE_0_5ANS", "NOMMUNI", "AIRE_DIFFUSION_2021", "AGE_BATIMENT", "AGE_TOITURE", "AGE_PLOMBERIE", "AGE_RESERVOIR_EAU_CHAUDE", "AGE_CHAUFFAGE_PRINCIPAL", "NOMBRE_CHAUFFAGES_EMPLACEMENT", "TYPE_CHAUFFAGE_PRINCIPAL", "ALIM_CHAUFFAGE_PRINCIPAL", "IND_CHAUF_COMBUSTION_SECONDAIRE", "INDICATEUR_MULTIPLE_LOGIS", "NB_CREANCIERS", "MONTANT_COUVERTURE", "LONGITUDE_X", "LATITUDE_Y"
+)])
+freq_data <- freq_data[, freq$feature_names]
+freq_data <- xgb.DMatrix(data = freq_data)
+```
+
+# Prédictions
+
+```{r primes}
+x <- predict_df(df.prep = data.prep, freq_data = freq_data, test_premium = FALSE)
+```
+
+```{r writeCSV, eval=FALSE}
+write.csv2(x = x, file= "PRIMES_DB_27.csv", dec = ",")
+test.primes(read.csv2("PRIMES_DB_27.csv"))
+```

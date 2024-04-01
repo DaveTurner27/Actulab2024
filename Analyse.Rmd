@@ -1,0 +1,303 @@
+---
+title: "Pré traitement des données"
+output: html_document
+---
+
+Importation des données et des paquetages.
+
+```{r import, message=FALSE, warning=FALSE}
+data <- read.csv("polices-historiques.csv")
+pred_data <- read.csv("polices-futures.csv")
+liste.paquetage <- c("ggplot2", "dplyr", "tidyverse", "factoextra", "plotly", "reshape2", "cluster", "mice")
+data.init <- data
+inst <- liste.paquetage %in% installed.packages()
+if(length(liste.paquetage[!inst]) > 0) install.packages(liste.paquetage[!inst])
+paquetages <- lapply(liste.paquetage, require, character.only = TRUE)
+```
+
+# Pré traitement
+
+```{r}
+str(data)
+```
+
+### Mode des variables
+
+On corrige le mode des variables.
+
+```{r correction mode}
+data$DATE_DEBUT_POLICE <- as.POSIXct(data$DATE_DEBUT_POLICE)
+data$OCCUPATION_ASSURE <- as.factor(data$OCCUPATION_ASSURE)
+data$NOMMUNI <- as.factor(data$NOMMUNI)
+data$TYPE_CHAUFFAGE_PRINCIPAL <- as.factor(data$TYPE_CHAUFFAGE_PRINCIPAL)
+data$ALIM_CHAUFFAGE_PRINCIPAL <- as.factor(data$ALIM_CHAUFFAGE_PRINCIPAL)
+data$IND_CHAUF_COMBUSTION_SECONDAIRE <- as.factor(data$IND_CHAUF_COMBUSTION_SECONDAIRE)
+data$INDICATEUR_MULTIPLE_LOGIS <- as.factor(data$INDICATEUR_MULTIPLE_LOGIS)
+data$CAUSE_SINISTRE[data$CAUSE_SINISTRE %in% ""] <- NA
+data$CAUSE_SINISTRE <- as.factor(data$CAUSE_SINISTRE)
+data$DATE_SINISTRE[data$DATE_SINISTRE %in% ""] <- NA
+data$DATE_SINISTRE <- as.POSIXct(data$DATE_SINISTRE)
+```
+
+### Valeurs manquantes
+
+Il faut gérer les valeurs manquantes dans les cotes de crédit. Cependant, comme les données à prédire comporte aussi des valeurs manquantes pour cette variable on décide de créer une variable indicatrice pour indiquer si la valeur est manquante ou non.
+
+```{r missing_pattern}
+mice::md.pattern(data, rotate.names = TRUE)
+```
+
+```{r creation de variable pour cote}
+indicatrice <- is.na(data$COTE_CREDIT)
+data$COTE_NULL <- as.factor(indicatrice)
+data$COTE_CREDIT[indicatrice] <- NA
+```
+
+# Visualisation
+
+## Inflation Sinistre
+
+On trace les montants des sinistres en fonction de la date du sinistre et on remarque quelques faits intéressants. D'abord, on remarque une tendance inflationniste exponentielle. Ensuite, la catégorie météo semble présentée une erreur.
+
+```{r reclam_date}
+ggplot(data[!is.na(data$DATE_SINISTRE), -5], aes(x=DATE_SINISTRE, y = log(MONTANT_PERTE), col=CAUSE_SINISTRE)) + geom_point(alpha=0.3) + labs(title = "Réclamation (log) en fonction du moment de sinistre", x="Date du sinistre", y="Perte (log)", col="Cause du sinistre", alpha=1) +
+    theme_minimal()
+```
+
+Il serait préférable de simplement enlever ces observations, même si un biais est introduit.
+
+```{r date_louche}
+sort(table(data$DATE_SINISTRE[data$CAUSE_SINISTRE %in% "meteo"]), decreasing = T)[1:5]
+table(data[data$DATE_SINISTRE %in% c("2022-11-28", "2022-11-27", "2022-11-29"), "CAUSE_SINISTRE"])
+idx <- (data$DATE_SINISTRE %in% c("2022-11-28", "2022-11-27", "2022-11-29")) & (data$CAUSE_SINISTRE %in% "meteo")
+data <- data[!idx, ]
+```
+
+Finalement on estime le taux d'inflation par régression linéaire simple.
+
+```{r lm_inflation}
+idx <- (1:nrow(data))[!is.na(data$DATE_SINISTRE)]
+DIFF_DATE <- as.numeric(max(data$DATE_SINISTRE, na.rm = T) - data$DATE_SINISTRE[idx], units = "days") / 365
+
+y <- log(data$MONTANT_PERTE[idx])
+inflation <- lm(y~DIFF_DATE+data[idx, "CAUSE_SINISTRE"])
+summary(inflation)
+paste("FORCE D'INTÉRETS :", 100 * round(-inflation$coefficients[2], 4), "%")
+```
+
+On actualise les pertes en date du "2023-12-26". Ce n'est pas parfait, mais c'est mieux!
+
+```{r ajustement_sinistres}
+ajustement <- exp(-inflation$coefficients[2]*DIFF_DATE)
+data$MONTANT_PERTE[idx] <- data$MONTANT_PERTE[idx] * ajustement
+ggplot(data[!is.na(data$DATE_SINISTRE), -5], aes(x=DATE_SINISTRE, y = log(MONTANT_PERTE), col=CAUSE_SINISTRE, shape=CAUSE_SINISTRE)) + geom_point(alpha=0.25) + theme_minimal()
+```
+
+## Inflation du prix des maisons
+
+```{r visualisation_inflation_prix}
+ggplot(data, aes(x=DATE_DEBUT_POLICE, y = log(COUT_REMPLACEMENT))) + geom_point(alpha=0.05) + theme_minimal()
+```
+
+```{r lm_prix_maisons}
+DIFF_DATE <- as.numeric(max(data$DATE_DEBUT_POLICE, na.rm = T) - data$DATE_DEBUT_POLICE, units = "days") / 365
+
+y <- log((data$MONTANT_COUVERTURE + data$COUT_REMPLACEMENT)/2)
+inflation <- lm(y~DIFF_DATE)
+summary(inflation)
+paste("FORCE D'INTÉRETS :", 100 * round(-inflation$coefficients[2], 4), "%")
+```
+
+On ajuste. C'est mieux!
+
+```{r ajustement_maisons}
+ajustement <- exp(-inflation$coefficients[2]*DIFF_DATE)
+data$MONTANT_COUVERTURE <- data$MONTANT_COUVERTURE * ajustement
+data$COUT_REMPLACEMENT <- data$COUT_REMPLACEMENT * ajustement
+samp <- sample(3E6, 1E5)
+ggplot(data[samp, ], aes(x=DATE_DEBUT_POLICE, y = log(COUT_REMPLACEMENT))) + geom_point(alpha=0.05) + theme_minimal()
+ggplot(data[samp, ], aes(x=DATE_DEBUT_POLICE, y = log(MONTANT_COUVERTURE))) + geom_point(alpha=0.05) + theme_minimal()
+```
+
+## Age
+
+```{r}
+ggplot(data) + geom_bar(aes(x=AGE_ASSURE))
+```
+
+On prendra le log de l'age
+
+```{r}
+data$gr_age <- as.factor(data$AGE_ASSURE %/% 5)
+df <- data[idx, ] %>% group_by(gr_age) %>% summarise(
+  Moyenne=mean(MONTANT_PERTE/MONTANT_COUVERTURE)
+)
+ggplot(df) + geom_point(aes(x=gr_age, y=Moyenne))
+```
+
+```{r}
+data$gr_age <- as.factor(data$AGE_ASSURE %/% 5)
+df <- data %>% group_by(gr_age) %>% summarise(
+  Moyenne=mean(MONTANT_PERTE > 0)
+)
+ggplot(df) + geom_point(aes(x=gr_age, y=Moyenne))
+```
+
+## Occupation
+
+```{r}
+sort(table(data$OCCUPATION_ASSURE), decreasing = T)[1:5]
+cat1 <- c("Employé de bureau - Personnel administratif", "Propriétaire d'un commerce ou d'une entreprise", "Administrateur - Cadre", "Enseignant / professeur", "Journalier", "Comptable", "Ingénieur", "Assurance (Agent, Courtier, Analyste de risque, etc)", "Informaticien", "Technicien de la santé", "Finance (agent, conseiller, courtier financier)", "Entrepreneur général", "Représentant", "Policier", "Agent-Courtier immobilier", "Médecin (incluant médecin spécialiste)", "Avocat", "Pompier", "Préposé aux bénéficiaires", "Science / Professionnel", "Technicien de recherche - laboratoire", "Ressources humaines", "Pharmacien", "Marketing - Communication (technicien, administrateur, publiciste, relationniste)", "Architecte", "Notaire", "Dentiste - Orthodontiste", "Travailleur social", "Expert en sinistre", "Arpenteur-géomètre", "Physiothérapeute", "Inspecteur", "Vétérinaire", "Estimateur - Évaluateur", "Actuaire", "Chiropraticien", "Personnel aérien - Pilote", "Optométriste", "Traducteur", "Denturologiste", "Diététicien - Nutritionniste", "Ostéopathe", "Fiscaliste", "Opticien", "Orthothérapeute", "Kinésithérapeute", "Urbaniste", "Audioprothésiste", "Économiste")
+cat2 <- c("Infirmier / infirmier auxiliaire", "Cultivateur-Fermier-Agriculteur", "Conducteur - (camions, public, taxi, livreur, etc.)", "Ouvrier de la construction", "Mécanicien", "Éducatrice en garderie", "Restauration (Serveur, Cuisinier, Plongeur, Traiteur)", "Électricien", "Menuisier - ébéniste", "Vendeur", "Coiffeur", "Entretien", "Plombier", "Dessinateur, Désigner, graphiste, imprimeur, typographe", "Commerce au détail - Employé", "Étudiant à temps plein, âgé de 24 ans ou moins", "Conducteur - Transport public", "Agronome", "Militaire", "Caissier", "Agent de sécurité", "Massothérapeute", "Ambulancier", "Horticulteur (botaniste, fleuriste, jardinier, paysagiste)", "Agent correctionnel", "Étudiant", "Boucher", "Couturier", "Artiste", "Photographe", "Agent de voyage", "Réceptionniste", "Pâtissier - Boulanger", "Bijoutier - Horloger", "Acupuncteur", "Personnalité publique (radio, télévision , journaux, etc)", "Préventionniste", "Bibliothécaire", "Libraire", "Pêcheur", "Cordonnier", "Athlète professionnel")
+autre <- c("Autre occupation", "Aucune occupation", "Occupation inconnue", "Personne au foyer")
+
+
+levels(data$OCCUPATION_ASSURE)[levels(data$OCCUPATION_ASSURE) %in% cat1] <- "cat1"
+levels(data$OCCUPATION_ASSURE)[levels(data$OCCUPATION_ASSURE) %in% cat2] <- "cat2"
+levels(data$OCCUPATION_ASSURE)[levels(data$OCCUPATION_ASSURE) %in% autre] <- "autre"
+data$OCCUPATION_ASSURE <- droplevels(data$OCCUPATION_ASSURE)
+table(data$OCCUPATION_ASSURE)
+```
+
+```{r}
+df <- data[idx, ] %>% group_by(OCCUPATION_ASSURE) %>% summarise(
+  Moyenne=mean(MONTANT_PERTE/MONTANT_COUVERTURE)
+)
+ggplot(df) + geom_point(aes(x=OCCUPATION_ASSURE, y=Moyenne))
+```
+
+## Cote de crédit
+
+Influence pas vrm la sévérité.
+
+```{r}
+ggplot(data) + geom_density(aes(x=COTE_CREDIT), fill="red", alpha=0.5)
+ggplot(data[idx, ]) + geom_point(aes(x=COTE_CREDIT, y=log(MONTANT_PERTE/MONTANT_COUVERTURE), col=CAUSE_SINISTRE), alpha=0.05)
+```
+
+```{r}
+data$gr_cote <- as.factor(data$COTE_CREDIT %/% 200)
+df <- data %>% group_by(gr_cote) %>% summarise(
+  Moyenne=mean(MONTANT_PERTE > 0)
+)
+ggplot(df) + geom_point(aes(x=gr_cote, y=Moyenne))
+```
+
+```{r}
+data <- data %>% mutate(
+    COTE_CREDIT = case_when(
+        COTE_CREDIT < 700 ~ "<700",
+        COTE_CREDIT < 800 ~ "700-800",
+        COTE_CREDIT >= 800 ~ ">=800",
+        TRUE ~ "NonDisp"
+    )
+)
+data$COTE_CREDIT <- as.factor(data$COTE_CREDIT)
+```
+
+## Expérience
+
+Regrouper \>2 avec 2
+
+```{r}
+ggplot(data) + geom_bar(aes(x=NB_SINISTRE_0_5ANS))
+```
+
+```{r}
+data <- data %>% mutate(
+    NB_SINISTRE_0_5ANS = case_when(
+        NB_SINISTRE_0_5ANS < 2 ~ as.character(NB_SINISTRE_0_5ANS),
+        TRUE ~ ">=2"
+    )
+)
+data$NB_SINISTRE_0_5ANS <- as.factor(data$NB_SINISTRE_0_5ANS)
+```
+
+## Géographie
+
+```{r}
+ggplot(data) + geom_bar(aes(x=NOMMUNI))
+```
+
+```{r}
+ggplot(data[!is.na(data$CAUSE_SINISTRE), ], aes(x=LONGITUDE_X, y=LATITUDE_Y, col=CAUSE_SINISTRE)) + geom_point(alpha=0.1)
+```
+
+```{r}
+levels(data$NOMMUNI)[table(data$NOMMUNI) < 50000] <- "AUTRE"
+data$NOMMUNI <- droplevels(data$NOMMUNI)
+```
+
+## Aire diffusion
+
+```{r}
+ggplot(data) + geom_density(aes(x=AIRE_DIFFUSION_2021-24*1e6), fill="red", alpha=0.5)
+```
+
+## Age matériel
+
+```{r}
+ggplot(data) + geom_density(aes(x=AGE_BATIMENT), fill="blue", alpha=0.5)
+ggplot(data) + geom_density(aes(x=AGE_TOITURE), fill="blue", alpha=0.5)
+ggplot(data) + geom_density(aes(x=AGE_PLOMBERIE), fill="blue", alpha=0.5)
+ggplot(data) + geom_density(aes(x=AGE_RESERVOIR_EAU_CHAUDE), fill="blue", alpha=0.5)
+ggplot(data) + geom_density(aes(x=AGE_CHAUFFAGE_PRINCIPAL), fill="blue", alpha=0.5)
+```
+
+## Chauffage
+
+```{r}
+ggplot(data) + geom_bar(aes(x=NOMBRE_CHAUFFAGES_EMPLACEMENT))
+data <- data %>% mutate(
+    NOMBRE_CHAUFFAGES_EMPLACEMENT = case_when(
+        NOMBRE_CHAUFFAGES_EMPLACEMENT < 3 ~ as.character(NOMBRE_CHAUFFAGES_EMPLACEMENT),
+        TRUE ~ ">=3"
+    )
+)
+data$NOMBRE_CHAUFFAGES_EMPLACEMENT <- as.factor(data$NOMBRE_CHAUFFAGES_EMPLACEMENT)
+
+ggplot(data) + geom_bar(aes(x=TYPE_CHAUFFAGE_PRINCIPAL))
+levels(data$TYPE_CHAUFFAGE_PRINCIPAL)[table(data$TYPE_CHAUFFAGE_PRINCIPAL) < 100000] <- "AUTRE"
+data$TYPE_CHAUFFAGE_PRINCIPAL <- droplevels(data$TYPE_CHAUFFAGE_PRINCIPAL)
+
+ggplot(data) + geom_bar(aes(x=ALIM_CHAUFFAGE_PRINCIPAL))
+levels(data$ALIM_CHAUFFAGE_PRINCIPAL)[table(data$ALIM_CHAUFFAGE_PRINCIPAL) < 100000] <- "NON_ELECTRIQUE"
+data$ALIM_CHAUFFAGE_PRINCIPAL <- droplevels(data$ALIM_CHAUFFAGE_PRINCIPAL)
+```
+
+## Indicatrice
+
+```{r}
+ggplot(data) + geom_bar(aes(x=IND_CHAUF_COMBUSTION_SECONDAIRE))
+ggplot(data) + geom_bar(aes(x=INDICATEUR_MULTIPLE_LOGIS))
+```
+
+## Créanciers
+
+```{r}
+ggplot(data) + geom_bar(aes(x=NB_CREANCIERS))
+```
+
+## Remplacement et montant de couverture
+
+```{r}
+ggplot(data) + geom_density(aes(x=log(COUT_REMPLACEMENT)), fill="blue", alpha=0.5)
+ggplot(data) + geom_density(aes(x=log(MONTANT_COUVERTURE)), fill="blue", alpha=0.5)
+cor(data$COUT_REMPLACEMENT, data$MONTANT_COUVERTURE)
+```
+
+On garde seulement le MONTANT_COUVERTURE, elles sont parfaitement corrélés.
+
+```{r modif.data}
+set.seed(6942069)
+samp.freq <- sample(nrow(data), round(0.75*nrow(data)))
+train.freq <- data[samp.freq, ]
+test.freq <- data[-samp.freq, ]
+write.csv2(train.freq, "train_freq.csv")
+write.csv2(test.freq, "test_freq.csv")
+
+train.sev <- train.freq[train.freq$MONTANT_PERTE > 0, ]
+test.sev <- test.freq[test.freq$MONTANT_PERTE > 0, ]
+write.csv2(train.sev, "train_sev.csv")
+write.csv2(test.sev, "test_sev.csv")
+```

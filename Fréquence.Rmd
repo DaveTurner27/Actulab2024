@@ -1,0 +1,149 @@
+---
+title: "Modèle de fréquence"
+author: "David Boulanger"
+date: "2024-03-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Importation des données, paquetages et fonctions R
+source("tools.R")
+```
+
+```{r}
+train.freq <- read.csv2("train_freq.csv")[, -1]
+test.freq <- read.csv2("test_freq.csv")[, -1]
+train.freq$CAUSE_SINISTRE[is.na(train.freq$CAUSE_SINISTRE)] <- "Aucun"
+test.freq$CAUSE_SINISTRE[is.na(test.freq$CAUSE_SINISTRE)] <- "Aucun"
+
+for(c in c("OCCUPATION_ASSURE", "COTE_CREDIT", "NB_SINISTRE_0_5ANS", "NOMMUNI", "NOMBRE_CHAUFFAGES_EMPLACEMENT", "TYPE_CHAUFFAGE_PRINCIPAL", "ALIM_CHAUFFAGE_PRINCIPAL", "IND_CHAUF_COMBUSTION_SECONDAIRE", "INDICATEUR_MULTIPLE_LOGIS", "CAUSE_SINISTRE")){
+    train.freq[, c] <- as.factor(train.freq[, c])
+    test.freq[, c] <- as.factor(test.freq[, c])
+}
+
+# Retirer les colones inutiles
+keep.cols <- c("AGE_ASSURE", "OCCUPATION_ASSURE", "COTE_CREDIT", "NB_SINISTRE_0_5ANS", "NOMMUNI", "AIRE_DIFFUSION_2021", "AGE_BATIMENT", "AGE_TOITURE", "AGE_PLOMBERIE", "AGE_RESERVOIR_EAU_CHAUDE", "AGE_CHAUFFAGE_PRINCIPAL", "NOMBRE_CHAUFFAGES_EMPLACEMENT", "TYPE_CHAUFFAGE_PRINCIPAL", "ALIM_CHAUFFAGE_PRINCIPAL", "IND_CHAUF_COMBUSTION_SECONDAIRE", "INDICATEUR_MULTIPLE_LOGIS", "NB_CREANCIERS", "MONTANT_COUVERTURE", "CAUSE_SINISTRE", "POLICE_ID", "MONTANT_PERTE", "LONGITUDE_X", "LATITUDE_Y")
+train.freq <- train.freq[, keep.cols]
+test.freq <- test.freq[, keep.cols]
+```
+
+Il est évident que :
+
+$$
+N \mid X \sim Multinomiale(1, p_0, p_{eau}, p_{feu}, p_{met})
+$$
+
+## GLM
+
+```{r glm, eval=FALSE}
+fit_freq_glm <- multinom(CAUSE_SINISTRE~.-POLICE_ID-MONTANT_PERTE, data = train.freq, model = TRUE, maxit = 160)
+saveRDS(fit_freq_glm, "freq_glm")
+```
+
+## XGBoost
+
+```{r}
+label_train <- sapply(train.freq$CAUSE_SINISTRE, function(x){
+    if(x == "Aucun")
+        return(0)
+    if(x == "degat_eau")
+        return(1)
+    if(x == "incendie")
+        return(2)
+    3
+})
+label_test <- sapply(test.freq$CAUSE_SINISTRE, function(x){
+    if(x == "Aucun")
+        return(0)
+    if(x == "degat_eau")
+        return(1)
+    if(x == "incendie")
+        return(2)
+    3
+})
+```
+
+```{r}
+# Convertir les variables catégorielles en encodage one-hot
+train_data <- model.matrix(~.-CAUSE_SINISTRE-POLICE_ID-MONTANT_PERTE, data = train.freq)
+test_data <- model.matrix(~.-CAUSE_SINISTRE-POLICE_ID-MONTANT_PERTE, data = test.freq)
+# Convertir les données en format de matrice xgboost
+dtrain <- xgb.DMatrix(data = train_data, label = label_train)
+dtest <- xgb.DMatrix(data = test_data, label = label_test)
+```
+
+```{r boost}
+# Définir les paramètres du modèle
+params <- list(
+  objective = "multi:softprob",  # Pour une classification multi-classe
+  eval_metric = "mlogloss",     # Métrique d'évaluation
+  num_class = length(unique(train.freq$CAUSE_SINISTRE)),  # Nombre de classes
+  
+  eta = 0.5,           # Taux d'apprentissage (learning rate)
+  max_depth = 5,       # Profondeur maximale de chaque arbre
+  min_child_weight = 100,  # Poids minimum requis pour créer un nouvel arbre
+  gamma = 0.01,           # Seuil de division de l'arbre
+  subsample = 0.55,     # Proportion d'échantillons à utiliser pour chaque arbre
+  colsample_bytree = 0.75,  # Proportion de caractéristiques à utiliser pour chaque arbre
+  lambda = 1,          # Paramètre de régularisation L2
+  alpha = 1            # Paramètre de régularisation L1
+)
+# Entraîner le modèle
+fit_freq_boost <- xgboost(params = params, data = dtrain, nrounds = 30, verbose = TRUE, print_every_n = 10)
+saveRDS(fit_freq_boost, "freq_boosting")
+```
+
+# Performance
+
+```{r predict_prob}
+fit_freq_boost <- readRDS("freq_boosting")
+fit_freq_glm <- readRDS("freq_glm")
+pred_probs_glm <- predict(fit_freq_glm, newdata = test.freq, type = "probs")
+# Faire des prédictions sur l'ensemble de test
+pred_probs_boost <- predict(fit_freq_boost, dtest, reshape = TRUE)
+```
+
+```{r predict_final}
+# # boost
+eau <- readRDS("eau_boosting")
+feu <- readRDS("feu_boosting")
+met <- readRDS("met_boosting")
+pred_sev_boost <- cbind(
+    exp(predict(eau, test.freq, type="response") + eau$var/2),
+    exp(predict(feu, test.freq, type="response") + feu$var/2),
+    exp(predict(met, test.freq, type="response") + met$var/2)
+)
+predictions_finales_boosting <- rowSums(pred_probs_boost[, -1] * pred_sev_boost)
+
+# glm
+eau_glm <- readRDS("eau_glm")
+feu_glm <- readRDS("feu_glm")
+met_glm <- readRDS("met_glm")
+pred_sev_glm <- cbind(
+    exp(predict(eau_glm, test.freq, type="response") + summary(eau_glm)$disp/2),
+    exp(predict(feu_glm, test.freq, type="response") + summary(feu_glm)$disp/2),
+    exp(predict(met_glm, test.freq, type="response") + summary(met_glm)$disp/2)
+)
+predictions_finales_glm <- rowSums(pred_probs_glm[, -1] * pred_sev_glm)
+
+# mixte
+predictions_finales_mixte <- rowSums(pred_probs_glm[, -1] * pred_sev_boost)
+```
+
+## GLM vs Boosting
+
+```{r graph_boost, message=FALSE}
+impact_analysis(test.freq$MONTANT_PERTE, predictions_finales_glm, predictions_finales_boosting, k=4)
+double_lift(test.freq$MONTANT_PERTE, predictions_finales_glm, predictions_finales_boosting, k=4)
+```
+
+## Boosting VS Mixte
+
+```{r message=FALSE}
+impact_analysis(test.freq$MONTANT_PERTE, predictions_finales_mixte, predictions_finales_boosting, k=4)
+double_lift(test.freq$MONTANT_PERTE, predictions_finales_mixte, predictions_finales_boosting, k=4)
+```
